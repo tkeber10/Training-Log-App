@@ -36,6 +36,11 @@
 const { useState, useEffect, useMemo } = React;
 
 // ── Plan constants (from master plan v7) ───────────────────────
+// GitHub OAuth config for Gist backup
+const GITHUB_CLIENT_ID = "Ov23li7f0nXxa5pT4Uo3";
+const GITHUB_REDIRECT_URI = "https://tkeber10.github.io/Training-Log-App/";
+const GITHUB_AUTH_URL = `https://github.com/login/oauth/authorize?client_id=${GITHUB_CLIENT_ID}&redirect_uri=${encodeURIComponent(GITHUB_REDIRECT_URI)}&scope=gist&allow_signup=false`;
+
 const PLAN = {
   calorieTarget: 2500,
   proteinTarget: 180,
@@ -44,16 +49,22 @@ const PLAN = {
     start: { date: "2026-06-13", weight: 180.9, bf: 22.3, lean: 140.5, fat: 40.4 },
     next: { date: "2027-01-15", label: "DEXA #4 — Phase 2 End" },
   },
+  // ±1 lb buffer band the user aims to stay within
+  band: 1.0,
   trajectory: [
     { date: "2026-06-13", weight: 180.9 },
-    { date: "2026-08-01", weight: 184.5 },
-    { date: "2026-09-13", weight: 185.5 },
-    { date: "2026-11-01", weight: 186.0 },
-    { date: "2027-01-15", weight: 186.5 },
+    { date: "2026-07-01", weight: 184.5 },
+    { date: "2026-08-01", weight: 185.7 },
+    { date: "2026-09-13", weight: 187.1 },
+    { date: "2026-11-01", weight: 188.8 },
+    { date: "2026-12-01", weight: 189.9 },
+    { date: "2027-01-15", weight: 191.0 },
   ],
 };
 const DAY_TARGETS = { training: 2550, zone2: 2500, golf: 2950, rest: 2400 };
 
+const RUN_SESSIONS = ["Zone 2 Run - 2026"];
+const isRun = (name) => RUN_SESSIONS.includes(name);
 const REST = { primary: 180, secondary: 120, isolation: 75 }; // seconds
 const SPLIT = {
   "Push - Lean Bulk - 2026": [
@@ -92,7 +103,6 @@ const SPLIT = {
     { name: "Incline Bicep Curl", range: "8-12", cat: "isolation" },
     { name: "Single Arm Tricep Pushdown", range: "8-12", cat: "isolation" },
     { name: "Cable Crunch", range: "8-12", cat: "isolation" },
-    { name: "Cable Lateral Raise", range: "8-12", cat: "isolation" },
   ],
 };
 
@@ -109,6 +119,36 @@ function saveKey(key, value) {
 const todayStr = () => { const d = new Date(); const o = d.getTimezoneOffset(); return new Date(d - o*60000).toISOString().slice(0,10); };
 const fmtDate = (s) => new Date(s + "T00:00:00").toLocaleDateString("en-US", { month: "short", day: "numeric" });
 const fmtRest = (sec) => { const m = Math.floor(sec/60), s = sec%60; return m && s ? `${m}m ${s}s` : m ? `${m}m` : `${s}s`; };
+
+// ── GitHub auth & gist backup helpers ──
+const getGitHubToken = () => localStorage.getItem("github_token");
+const setGitHubToken = (token) => localStorage.setItem("github_token", token);
+const clearGitHubToken = () => localStorage.removeItem("github_token");
+
+const createGitHubGist = async (token, content) => {
+  const now = new Date();
+  const ts = now.toISOString().replace(/[:-]/g, "").slice(0, 15);
+  const filename = `fitness-${ts}.json`;
+  try {
+    const resp = await fetch("https://api.github.com/gists", {
+      method: "POST",
+      headers: {
+        "Authorization": `token ${token}`,
+        "Content-Type": "application/json",
+      },
+      body: JSON.stringify({
+        description: `Fitness tracker backup - ${now.toLocaleString()}`,
+        public: false,
+        files: { [filename]: { content: JSON.stringify(content, null, 2) } },
+      }),
+    });
+    if (!resp.ok) throw new Error(`HTTP ${resp.status}`);
+    const gist = await resp.json();
+    return { success: true, url: gist.html_url, id: gist.id };
+  } catch (e) {
+    return { success: false, error: e.message };
+  }
+};
 
 const C = {
   bg:"#11151c", panel:"#1a212b", panel2:"#222b38", line:"#2e3a49",
@@ -161,7 +201,9 @@ function App() {
         <input type="date" value={sel} onChange={(e)=>setSel(e.target.value)} style={dateInput} />
       </header>
 
-      <main style={{padding:"18px 16px 96px", maxWidth:720, margin:"0 auto"}}>
+      <DayStrip sel={sel} setSel={setSel} days={days} completed={completed} workouts={workouts} />
+
+      <main style={{padding:"14px 16px 96px", maxWidth:720, margin:"0 auto"}}>
         {tab === "today" && <TodayView day={day} setDay={setDay} totals={totals} target={target} savedMeals={savedMeals} setSavedMeals={setSavedMeals} />}
         {tab === "workout" && <WorkoutView sel={sel} workouts={workouts} setWorkouts={setWorkouts} active={active} setActive={setActive} completed={completed} setCompleted={setCompleted} />}
         {tab === "progress" && <ProgressView days={days} completed={completed} setCompleted={setCompleted} workouts={workouts} savedMeals={savedMeals} setDays={setDays} setWorkouts={setWorkouts} setSavedMeals={setSavedMeals} />}
@@ -176,6 +218,48 @@ function App() {
           </button>
         ))}
       </nav>
+    </div>
+  );
+}
+
+// ── Weekly day strip (MyFitnessPal-style) with prev/next day arrows ──
+function DayStrip({ sel, setSel, days, completed, workouts }) {
+  const shift = (dateStr, n) => {
+    const d = new Date(dateStr + "T00:00:00");
+    d.setDate(d.getDate() + n);
+    return d.toISOString().slice(0, 10);
+  };
+  // build the week (Sun–Sat) containing sel
+  const selDate = new Date(sel + "T00:00:00");
+  const weekStart = shift(sel, -selDate.getDay());
+  const week = Array.from({ length: 7 }, (_, i) => shift(weekStart, i));
+  const DOW = ["S", "M", "T", "W", "T", "F", "S"];
+
+  return (
+    <div style={dayStripWrap}>
+      <button onClick={() => setSel(shift(sel, -1))} style={arrowBtn} aria-label="Previous day">‹</button>
+      <div style={{ display: "flex", flex: 1, justifyContent: "space-between", gap: 2 }}>
+        {week.map((d) => {
+          const isSel = d === sel;
+          const dd = new Date(d + "T00:00:00");
+          const isToday = d === todayStr();
+          const rec = completed[d] || {};
+          const hasData = (days[d] && (days[d].weight || (days[d].meals && days[d].meals.length))) || workouts[d];
+          const dot = rec.gym ? C.green : rec.zone2 ? C.blue : hasData ? C.dim : "transparent";
+          return (
+            <button key={d} onClick={() => setSel(d)} style={{
+              ...dayCell,
+              background: isSel ? C.amber : "transparent",
+              color: isSel ? "#1a1206" : C.text,
+            }}>
+              <span style={{ fontSize: 10, opacity: 0.7 }}>{DOW[dd.getDay()]}</span>
+              <span style={{ fontSize: 15, fontWeight: isSel || isToday ? 700 : 400 }}>{dd.getDate()}</span>
+              <span style={{ width: 5, height: 5, borderRadius: 3, background: isSel ? "#1a1206" : dot }} />
+            </button>
+          );
+        })}
+      </div>
+      <button onClick={() => setSel(shift(sel, 1))} style={arrowBtn} aria-label="Next day">›</button>
     </div>
   );
 }
@@ -297,23 +381,28 @@ function Stat({ big, label, sub, pct, color, over }) {
   );
 }
 
-// ── Rest timer ─────────────────────────────────────────────────
-function RestTimer({ seconds, onDone, onSkip }) {
-  const [left, setLeft] = useState(seconds);
+// ── Rest timer (timestamp-based: keeps correct time even when app is minimized) ──
+function RestTimer({ endAt, onDone, onSkip }) {
+  const [now, setNow] = useState(Date.now());
   const [over, setOver] = useState(false);
 
-  useEffect(() => { setLeft(seconds); setOver(false); }, [seconds]);
   useEffect(() => {
-    if (left <= 0) {
-      if (!over) {
-        setOver(true);
-        if (navigator.vibrate) navigator.vibrate([200, 100, 200]);
-        if (onDone) onDone();
-      }
-      return;
+    setOver(false);
+    // tick every 250ms; recompute from wall-clock so minimizing doesn't pause it
+    const id = setInterval(() => setNow(Date.now()), 250);
+    // also resync immediately when the tab/app becomes visible again
+    const onVis = () => setNow(Date.now());
+    document.addEventListener("visibilitychange", onVis);
+    return () => { clearInterval(id); document.removeEventListener("visibilitychange", onVis); };
+  }, [endAt]);
+
+  const left = Math.round((endAt - now) / 1000);
+  useEffect(() => {
+    if (left <= 0 && !over) {
+      setOver(true);
+      if (navigator.vibrate) navigator.vibrate([200, 100, 200]);
+      if (onDone) onDone();
     }
-    const t = setTimeout(() => setLeft((l) => l - 1), 1000);
-    return () => clearTimeout(t);
   }, [left, over, onDone]);
 
   const mm = Math.floor(Math.abs(left) / 60);
@@ -343,7 +432,8 @@ function RestTimer({ seconds, onDone, onSkip }) {
 
 function WorkoutView({ sel, workouts, setWorkouts, active, setActive, completed, setCompleted }) {
   const [session, setSession] = useState("Push - Lean Bulk - 2026");
-  const [timer, setTimer] = useState(null); // { seconds, key }
+  const [timer, setTimer] = useState(null); // { endAt }
+  const [abandonArmed, setAbandonArmed] = useState(false);
 
   const lastTimeFor = (name) => {
     const prior = Object.keys(workouts).filter((d)=>d<sel).sort((a,b)=>b.localeCompare(a));
@@ -370,14 +460,26 @@ function WorkoutView({ sel, workouts, setWorkouts, active, setActive, completed,
 
   // ── Start / finish / abandon ──
   const startSession = () => {
+    if (isRun(session)) {
+      setActive({ name: session, date: sel, run: true, startedAt: Date.now(),
+        dist: "", time: "", hr: "" });
+      setTimer(null);
+      return;
+    }
     setActive({
       name: session,
       date: sel,
       startedAt: Date.now(),
-      exercises: SPLIT[session].map((ex) => ({
-        exercise: ex.name, range: ex.range, cat: ex.cat,
-        sets: [{ w: "", r: "", done: false }],
-      })),
+      exercises: SPLIT[session].map((ex) => {
+        const last = lastTimeFor(ex.name);
+        // prefill NUMBER of sets AND their weight/reps from last time (default 3 empty if none)
+        const n = last ? last.sets.length : 3;
+        return { exercise: ex.name, range: ex.range, cat: ex.cat,
+          sets: Array.from({ length: n }, (_, i) => {
+            const prevSet = last && last.sets[i];
+            return { w: prevSet ? prevSet.w : "", r: prevSet ? prevSet.r : "", done: false };
+          }) };
+      }),
     });
     setTimer(null);
   };
@@ -393,20 +495,35 @@ function WorkoutView({ sel, workouts, setWorkouts, active, setActive, completed,
     const s = ex[ei].sets[si];
     if (s.w === "" && s.r === "") return;
     ex[ei] = { ...ex[ei], sets: ex[ei].sets.map((x, i) => i === si ? { ...x, done: true } : x) };
-    // auto-add next empty set if this was the last
     if (si === ex[ei].sets.length - 1) ex[ei].sets.push({ w: "", r: "", done: false });
     updateActive({ exercises: ex });
-    // start rest timer based on category
-    setTimer({ seconds: REST[ex[ei].cat] || 90, key: Date.now() });
+    setTimer({ endAt: Date.now() + (REST[ex[ei].cat] || 90) * 1000 });
+  };
+  const unlogSet = (ei, si) => { // make a logged set editable again
+    const ex = [...active.exercises];
+    ex[ei] = { ...ex[ei], sets: ex[ei].sets.map((x, i) => i === si ? { ...x, done: false } : x) };
+    updateActive({ exercises: ex });
   };
   const addSet = (ei) => {
     const ex = [...active.exercises];
     ex[ei] = { ...ex[ei], sets: [...ex[ei].sets, { w: "", r: "", done: false }] };
     updateActive({ exercises: ex });
   };
+  const removeSet = (ei, si) => {
+    const ex = [...active.exercises];
+    if (ex[ei].sets.length <= 1) return;
+    ex[ei] = { ...ex[ei], sets: ex[ei].sets.filter((_, i) => i !== si) };
+    updateActive({ exercises: ex });
+  };
 
   const finishSession = () => {
-    // Save logged sets into workouts history (only sets with data)
+    if (active.run) {
+      const rec = { run: true, dist: active.dist, time: active.time, hr: active.hr };
+      setWorkouts((w) => ({ ...w, [active.date]: rec }));
+      setCompleted((c) => ({ ...c, [active.date]: { ...(c[active.date] || {}), zone2: true } }));
+      setActive(null); setTimer(null);
+      return;
+    }
     const cleaned = active.exercises
       .map((ex) => ({ exercise: ex.exercise, range: ex.range, cat: ex.cat,
         sets: ex.sets.filter((s) => s.w !== "" || s.r !== "").map((s) => ({ w: s.w, r: s.r })) }))
@@ -417,55 +534,102 @@ function WorkoutView({ sel, workouts, setWorkouts, active, setActive, completed,
     setTimer(null);
   };
   const abandonSession = () => {
-    if (confirm("Abandon this workout? Nothing will be saved.")) {
-      setActive(null);
-      setTimer(null);
-    }
+    if (!abandonArmed) { setAbandonArmed(true); return; }
+    setActive(null);
+    setTimer(null);
+    setAbandonArmed(false);
   };
 
   // ── No active session: show start screen + today's saved (if any) ──
   if (!active) {
     const todaysLogged = workouts[sel];
+    const allSessions = [...Object.keys(SPLIT), ...RUN_SESSIONS];
     return (
       <React.Fragment>
         <div style={card}>
           <span style={fieldLabel}>Start a workout</span>
           <div style={{display:"flex", gap:8, marginTop:8}}>
             <select value={session} onChange={(e)=>setSession(e.target.value)} style={{...input, flex:1}}>
-              {Object.keys(SPLIT).map((s)=><option key={s}>{s}</option>)}
+              {allSessions.map((s)=><option key={s}>{s}</option>)}
             </select>
             <button onClick={startSession} style={addBtn}>Start</button>
           </div>
           <p style={{fontSize:11, color:C.dim, margin:"8px 0 0"}}>
-            Press Start to run the session — log each set and rest timers begin automatically.
+            {isRun(session)
+              ? "Run session — log distance, time and average heart rate when done."
+              : "Lifting session — set count is prefilled from last time; rest timers start automatically."}
           </p>
         </div>
 
-        {todaysLogged && todaysLogged.length > 0 && (
+        {todaysLogged && (
           <div style={{marginTop:14}}>
-            <div style={{...card, marginBottom:10, borderColor:C.green}}>
-              <span style={{color:C.green, fontWeight:600, fontSize:13}}>✓ Workout completed {fmtDate(sel)}</span>
-            </div>
-            {todaysLogged.map((ex,ei)=>(
-              <div key={ei} style={{...card, marginBottom:8}}>
-                <div style={{fontWeight:600, fontSize:14, marginBottom:4}}>{ex.exercise}</div>
-                <div style={{fontSize:13, color:C.dim}}>
-                  {ex.sets.map((s,i)=><span key={i}>{s.w}×{s.r}{i<ex.sets.length-1?" · ":""}</span>)}
+            {todaysLogged.run ? (
+              <div style={{...card, borderColor:C.blue}}>
+                <span style={{color:C.blue, fontWeight:600, fontSize:13}}>✓ Zone 2 run — {fmtDate(sel)}</span>
+                <div style={{fontSize:13, color:C.dim, marginTop:6}}>
+                  {todaysLogged.dist} km · {todaysLogged.time} min · {todaysLogged.hr} bpm avg
+                  {todaysLogged.dist && todaysLogged.time ? ` · ${(todaysLogged.time/todaysLogged.dist).toFixed(1)} min/km` : ""}
                 </div>
               </div>
-            ))}
+            ) : todaysLogged.length > 0 ? (
+              <React.Fragment>
+                <div style={{...card, marginBottom:10, borderColor:C.green}}>
+                  <span style={{color:C.green, fontWeight:600, fontSize:13}}>✓ Workout completed {fmtDate(sel)}</span>
+                </div>
+                {todaysLogged.map((ex,ei)=>(
+                  <div key={ei} style={{...card, marginBottom:8}}>
+                    <div style={{fontWeight:600, fontSize:14, marginBottom:4}}>{ex.exercise}</div>
+                    <div style={{fontSize:13, color:C.dim}}>
+                      {ex.sets.map((s,i)=><span key={i}>{s.w}×{s.r}{i<ex.sets.length-1?" · ":""}</span>)}
+                    </div>
+                  </div>
+                ))}
+              </React.Fragment>
+            ) : null}
           </div>
         )}
       </React.Fragment>
     );
   }
 
-  // ── Active session running ──
+  // ── Active RUN session ──
+  if (active.run) {
+    const pace = active.dist && active.time ? (active.time / active.dist).toFixed(1) : null;
+    return (
+      <React.Fragment>
+        <div style={{...card, marginBottom:14, display:"flex", alignItems:"center", gap:10}}>
+          <div style={{flex:1}}>
+            <div style={{fontWeight:600, fontSize:15}}>{active.name}</div>
+            <div style={{fontSize:12, color:C.dim, marginTop:2}}>Log your run</div>
+          </div>
+          <button onClick={abandonSession} style={{...ghostBtn, borderColor:C.red, color: abandonArmed?"#fff":C.red, background: abandonArmed?C.red:"transparent", marginTop:0}}>{abandonArmed ? "Tap to confirm" : "Abandon"}</button>
+        </div>
+        <div style={card}>
+          <label style={{display:"block", marginBottom:10}}>
+            <span style={fieldLabel}>Total distance (km)</span>
+            <input type="number" inputMode="decimal" placeholder="e.g. 6.0" value={active.dist} onChange={(e)=>updateActive({dist:e.target.value})} style={input} />
+          </label>
+          <label style={{display:"block", marginBottom:10}}>
+            <span style={fieldLabel}>Total time (min)</span>
+            <input type="number" inputMode="decimal" placeholder="e.g. 45" value={active.time} onChange={(e)=>updateActive({time:e.target.value})} style={input} />
+          </label>
+          <label style={{display:"block"}}>
+            <span style={fieldLabel}>Average heart rate (bpm)</span>
+            <input type="number" inputMode="numeric" placeholder="e.g. 135" value={active.hr} onChange={(e)=>updateActive({hr:e.target.value})} style={input} />
+          </label>
+          {pace && <div style={{marginTop:12, fontSize:14, color:C.amber, fontWeight:600}}>Pace: {pace} min/km</div>}
+        </div>
+        <button onClick={finishSession} style={finishBtn}>Finish &amp; Save Run</button>
+      </React.Fragment>
+    );
+  }
+
+  // ── Active LIFTING session ──
   const totalSets = active.exercises.reduce((a, ex) => a + ex.sets.filter((s) => s.done).length, 0);
   return (
     <React.Fragment>
       {timer && (
-        <RestTimer key={timer.key} seconds={timer.seconds} onSkip={() => setTimer(null)} />
+        <RestTimer key={timer.endAt} endAt={timer.endAt} onSkip={() => setTimer(null)} />
       )}
 
       <div style={{...card, marginBottom:14, display:"flex", alignItems:"center", gap:10}}>
@@ -473,7 +637,7 @@ function WorkoutView({ sel, workouts, setWorkouts, active, setActive, completed,
           <div style={{fontWeight:600, fontSize:15}}>{active.name}</div>
           <div style={{fontSize:12, color:C.dim, marginTop:2}}>{totalSets} sets logged</div>
         </div>
-        <button onClick={abandonSession} style={{...ghostBtn, borderColor:C.red, color:C.red, marginTop:0}}>Abandon</button>
+        <button onClick={abandonSession} style={{...ghostBtn, borderColor:C.red, color: abandonArmed?"#fff":C.red, background: abandonArmed?C.red:"transparent", marginTop:0}}>{abandonArmed ? "Tap to confirm" : "Abandon"}</button>
       </div>
 
       {active.exercises.map((ex, ei) => {
@@ -501,13 +665,14 @@ function WorkoutView({ sel, workouts, setWorkouts, active, setActive, completed,
             {ex.sets.map((s,si)=>{
               const ref = last && last.sets[si];
               return (
-                <div key={si} style={{display:"flex", gap:8, alignItems:"center", marginBottom:6, opacity: s.done?0.55:1}}>
+                <div key={si} style={{display:"flex", gap:8, alignItems:"center", marginBottom:6}}>
                   <span style={{color:C.dim, fontSize:12, width:38}}>#{si+1}</span>
-                  <input type="number" inputMode="decimal" placeholder={ref?`${ref.w}`:"weight"} value={s.w} onChange={(e)=>updateSet(ei,si,"w",e.target.value)} disabled={s.done} style={{...input, flex:1}} />
-                  <input type="number" inputMode="numeric" placeholder={ref?`${ref.r}`:"reps"} value={s.r} onChange={(e)=>updateSet(ei,si,"r",e.target.value)} disabled={s.done} style={{...input, flex:1}} />
+                  <input type="number" inputMode="decimal" placeholder={ref?`${ref.w}`:"weight"} value={s.w} onChange={(e)=>updateSet(ei,si,"w",e.target.value)} style={{...input, flex:1, opacity: s.done?0.7:1}} />
+                  <input type="number" inputMode="numeric" placeholder={ref?`${ref.r}`:"reps"} value={s.r} onChange={(e)=>updateSet(ei,si,"r",e.target.value)} style={{...input, flex:1, opacity: s.done?0.7:1}} />
                   {s.done
-                    ? <span style={{color:C.green, fontSize:18, width:34, textAlign:"center"}}>✓</span>
+                    ? <button onClick={()=>unlogSet(ei,si)} style={{...logBtn, background:"transparent", border:`1px solid ${C.green}`, color:C.green}}>✓ edit</button>
                     : <button onClick={()=>logSet(ei,si)} style={logBtn}>Log</button>}
+                  <button onClick={()=>removeSet(ei,si)} style={delBtn}>×</button>
                 </div>
               );
             })}
@@ -536,10 +701,6 @@ function WorkoutCalendar({ completed, setCompleted }) {
   for (let d = 1; d <= daysInMonth; d++) cells.push(d);
 
   const keyFor = (d) => `${month.y}-${String(month.m+1).padStart(2,"0")}-${String(d).padStart(2,"0")}`;
-  const toggleZone2 = (d) => {
-    const k = keyFor(d);
-    setCompleted((c) => ({ ...c, [k]: { ...(c[k]||{}), zone2: !(c[k] && c[k].zone2) } }));
-  };
 
   const prevMonth = () => setMonth((mm) => mm.m === 0 ? { y: mm.y-1, m: 11 } : { y: mm.y, m: mm.m-1 });
   const nextMonth = () => setMonth((mm) => mm.m === 11 ? { y: mm.y+1, m: 0 } : { y: mm.y, m: mm.m+1 });
@@ -576,11 +737,9 @@ function WorkoutCalendar({ completed, setCompleted }) {
           }
           return (
             <div key={i}
-              onClick={() => planned === "zone2" ? toggleZone2(d) : null}
               style={{
                 aspectRatio:"1", borderRadius:8, border:`1px solid ${bd}`, background:bg,
                 display:"flex", flexDirection:"column", alignItems:"center", justifyContent:"center",
-                cursor: planned === "zone2" ? "pointer" : "default",
                 outline: isToday ? `2px solid ${C.amber}` : "none", outlineOffset:"-1px",
               }}>
               <span style={{fontSize:12, color: did ? fg : C.text, fontWeight: did ? 700 : 400}}>{d}</span>
@@ -594,11 +753,135 @@ function WorkoutCalendar({ completed, setCompleted }) {
       <div style={{display:"flex", gap:14, marginTop:12, fontSize:11, color:C.dim, flexWrap:"wrap"}}>
         <span><span style={{color:C.green}}>■</span> gym done</span>
         <span><span style={{color:C.blue}}>■</span> zone 2 done</span>
-        <span style={{color:C.dim}}>tap a run day to toggle it</span>
       </div>
       <p style={{fontSize:11, color:C.dim, margin:"8px 0 0"}}>
-        Gym days (Mon/Tue/Thu/Fri) auto-check when you finish a workout. Running days (Wed/Sat) — tap to mark done.
+        Days auto-check when you finish a workout — gym (Mon/Tue/Thu/Fri) from a lifting session, run (Wed/Sat) from a Zone 2 run.
       </p>
+    </div>
+  );
+}
+
+// ── Interactive weight chart with zoom + tap tooltip ──────────────
+function WeightChart({ weighIns }) {
+  const [view, setView] = useState("full"); // 'full' | 'rolling'
+  const [picked, setPicked] = useState(null); // index into visible weigh-ins
+
+  // determine window [winStart, winEnd] in ms
+  const phaseStart = new Date(PLAN.dexa.start.date).getTime();
+  const phaseEnd = new Date(PLAN.dexa.next.date).getTime();
+  let winStart = phaseStart, winEnd = phaseEnd;
+  if (view === "rolling") {
+    const lastMs = weighIns.length ? new Date(weighIns[weighIns.length-1].date).getTime() : Date.now();
+    winEnd = lastMs + 2*86400000;          // small pad after latest entry
+    winStart = winEnd - 30*86400000;        // ~4 weeks back from latest
+  }
+  const span = (winEnd - winStart) || 1;
+
+  // visible weigh-ins within window
+  const vis = weighIns.filter((w)=>{ const t=new Date(w.date).getTime(); return t>=winStart-1 && t<=winEnd+1; });
+
+  // 7-day rolling average over ALL weigh-ins (so the line is correct at window edges), then filter to window
+  const avgPts = useMemo(()=>{
+    const out=[];
+    for (let i=0;i<weighIns.length;i++){
+      const endT=new Date(weighIns[i].date).getTime();
+      const windowVals=weighIns.filter((w)=>{ const t=new Date(w.date).getTime(); return t<=endT && t>endT-7*86400000; }).map((w)=>w.weight);
+      const a=windowVals.reduce((x,y)=>x+y,0)/windowVals.length;
+      out.push({ date: weighIns[i].date, weight: a });
+    }
+    return out;
+  }, [weighIns]);
+
+  // y-axis bounds from visible data + projection within window
+  const projInWin = PLAN.trajectory.filter((t)=>{ const ms=new Date(t.date).getTime(); return ms>=winStart-1 && ms<=winEnd+1; });
+  const allW=[...vis.map((w)=>w.weight), ...projInWin.map((t)=>t.weight)];
+  if (allW.length===0) allW.push(PLAN.dexa.start.weight);
+  const minW=Math.floor(Math.min(...allW)-1.5), maxW=Math.ceil(Math.max(...allW)+1.5);
+
+  const PADX=4; // % horizontal padding so edge points are visible/tappable
+  const xOf=(ms)=>PADX + ((ms-winStart)/span)*(100-2*PADX);
+  const yOf=(w)=>100-((w-minW)/(maxW-minW||1))*100;
+  const xy=(date,w)=>[xOf(new Date(date).getTime()), Math.max(0,Math.min(100,yOf(w)))];
+  const toPath=(pts)=>pts.map((p,i)=>`${i?"L":"M"}${p[0]},${p[1]}`).join(" ");
+
+  // build projection line + band clipped to window (interpolate is overkill; sample trajectory pts in-window plus edges)
+  const projPts = PLAN.trajectory.map((t)=>xy(t.date,t.weight));
+  const bandU = PLAN.trajectory.map((t)=>xy(t.date,t.weight+PLAN.band));
+  const bandL = PLAN.trajectory.map((t)=>xy(t.date,t.weight-PLAN.band));
+  const bandPath = toPath(bandU)+" "+bandL.slice().reverse().map((p)=>`L${p[0]},${p[1]}`).join(" ")+" Z";
+
+  const actualPts = vis.map((w)=>xy(w.date,w.weight));
+  const avgVis = avgPts.filter((w)=>{ const t=new Date(w.date).getTime(); return t>=winStart-1 && t<=winEnd+1; });
+  const avgLine = avgVis.map((w)=>xy(w.date,w.weight));
+
+  const sel = picked!=null && vis[picked] ? vis[picked] : null;
+
+  return (
+    <div style={card}>
+      <div style={{display:"flex", alignItems:"center", marginBottom:6}}>
+        <span style={{...fieldLabel, flex:1}}>Weight vs projection</span>
+        <div style={{display:"flex", gap:4}}>
+          {[["rolling","4 wks"],["full","Full"]].map(([k,label])=>(
+            <button key={k} onClick={()=>{setView(k); setPicked(null);}} style={{
+              ...miniToggle,
+              background: view===k?C.amber:C.panel2,
+              color: view===k?"#1a1206":C.dim,
+              borderColor: view===k?C.amber:C.line,
+            }}>{label}</button>
+          ))}
+        </div>
+      </div>
+
+      {/* tooltip area (fixed height so layout doesn't jump) */}
+      <div style={{height:22, marginBottom:2}}>
+        {sel ? (
+          <span style={{fontSize:13, color:C.amber, fontWeight:600}}>
+            {fmtDate(sel.date)} — {sel.weight.toFixed(1)} lb
+            {sel.note ? <span style={{color:C.dim, fontWeight:400}}> · {sel.note}</span> : null}
+          </span>
+        ) : (
+          <span style={{fontSize:12, color:C.dim}}>Tap a point to see its date &amp; weight</span>
+        )}
+      </div>
+
+      <div style={{position:"relative", height:210}}>
+        <svg viewBox="0 0 100 100" preserveAspectRatio="none" style={{width:"100%", height:"100%"}}>
+          {[0,25,50,75,100].map((g)=><line key={g} x1="0" y1={g} x2="100" y2={g} stroke={C.line} strokeWidth="0.3" />)}
+          <path d={bandPath} fill="rgba(224,164,73,0.15)" stroke="none" />
+          <path d={toPath(projPts)} fill="none" stroke={C.dim} strokeWidth="0.8" strokeDasharray="2 2" vectorEffect="non-scaling-stroke" />
+          {view==="rolling" && avgLine.length>1 && (
+            <path d={toPath(avgLine)} fill="none" stroke={C.green} strokeWidth="1.2" vectorEffect="non-scaling-stroke" />
+          )}
+          {actualPts.length>0 && <path d={toPath(actualPts)} fill="none" stroke={C.amber} strokeWidth="1.4" vectorEffect="non-scaling-stroke" />}
+          {/* selected highlight */}
+          {sel && (()=>{ const p=xy(sel.date,sel.weight); return <line x1={p[0]} y1="0" x2={p[0]} y2="100" stroke={C.amber} strokeWidth="0.5" strokeDasharray="1 1" vectorEffect="non-scaling-stroke" />; })()}
+        </svg>
+        {/* tappable overlay dots (HTML, easier hit targets than SVG on mobile) */}
+        <div style={{position:"absolute", inset:0}}>
+          {actualPts.map((p,i)=>(
+            <button key={i} onClick={()=>setPicked(picked===i?null:i)} aria-label={`${vis[i].date} ${vis[i].weight}`}
+              style={{position:"absolute", left:`${p[0]}%`, top:`${p[1]}%`, transform:"translate(-50%,-50%)",
+                width:22, height:22, padding:0, borderRadius:"50%", border:"none", background:"transparent", cursor:"pointer"}}>
+              <span style={{display:"block", width: picked===i?10:7, height: picked===i?10:7, margin:"auto",
+                borderRadius:"50%", background:C.amber, border: picked===i?`2px solid ${C.text}`:"none"}} />
+            </button>
+          ))}
+        </div>
+        <div style={{position:"absolute", top:0, left:4, fontSize:10, color:C.dim}}>{maxW} lb</div>
+        <div style={{position:"absolute", bottom:0, left:4, fontSize:10, color:C.dim}}>{minW} lb</div>
+      </div>
+
+      <div style={{display:"flex", justifyContent:"space-between", fontSize:10, color:C.dim, marginTop:4}}>
+        <span>{fmtDate(new Date(winStart).toISOString().slice(0,10))}</span>
+        <span>{fmtDate(new Date(winEnd).toISOString().slice(0,10))}{view==="full"?" (DEXA)":""}</span>
+      </div>
+
+      <div style={{display:"flex", gap:14, marginTop:10, fontSize:11, color:C.dim, flexWrap:"wrap"}}>
+        <span><span style={{color:C.amber}}>●</span> weigh-ins</span>
+        {view==="rolling" && <span><span style={{color:C.green}}>▬</span> 7-day avg</span>}
+        <span><span style={{color:C.dim}}>┄</span> projected</span>
+        <span><span style={{color:C.amber}}>▬</span> ±1 lb band</span>
+      </div>
     </div>
   );
 }
@@ -616,38 +899,11 @@ function ProgressView({ days, completed, setCompleted, workouts, savedMeals, set
     return ((last-first)/dd)*7;
   }, [weighIns]);
 
-  const allW=[...PLAN.trajectory.map((t)=>t.weight), ...weighIns.map((w)=>w.weight)];
-  const minW=Math.floor(Math.min(...allW,178)-1), maxW=Math.ceil(Math.max(...allW,190)+1);
-  const startMs=new Date(PLAN.dexa.start.date).getTime(), endMs=new Date(PLAN.dexa.next.date).getTime(), span=endMs-startMs;
-  const xy=(date,weight)=>{ const x=((new Date(date).getTime()-startMs)/span)*100; const y=100-((weight-minW)/(maxW-minW))*100; return [Math.max(0,Math.min(100,x)), Math.max(0,Math.min(100,y))]; };
-  const projLine=PLAN.trajectory.map((t)=>xy(t.date,t.weight));
-  const actualLine=weighIns.map((w)=>xy(w.date,w.weight));
-  const toPath=(pts)=>pts.map((p,i)=>`${i?"L":"M"}${p[0]},${p[1]}`).join(" ");
-
   return (
     <React.Fragment>
       <WorkoutCalendar completed={completed} setCompleted={setCompleted} />
 
-      <div style={card}>
-        <span style={fieldLabel}>Phase 2 progress vs projection</span>
-        <div style={{position:"relative", marginTop:14, height:200}}>
-          <svg viewBox="0 0 100 100" preserveAspectRatio="none" style={{width:"100%", height:"100%"}}>
-            {[0,25,50,75,100].map((g)=><line key={g} x1="0" y1={g} x2="100" y2={g} stroke={C.line} strokeWidth="0.3" />)}
-            <path d={toPath(projLine)} fill="none" stroke={C.dim} strokeWidth="0.8" strokeDasharray="2 2" vectorEffect="non-scaling-stroke" />
-            {actualLine.length>0 && <path d={toPath(actualLine)} fill="none" stroke={C.amber} strokeWidth="1.4" vectorEffect="non-scaling-stroke" />}
-            {actualLine.map((p,i)=><circle key={i} cx={p[0]} cy={p[1]} r="1.2" fill={C.amber} vectorEffect="non-scaling-stroke" />)}
-          </svg>
-          <div style={{position:"absolute", top:0, left:4, fontSize:10, color:C.dim}}>{maxW} lb</div>
-          <div style={{position:"absolute", bottom:0, left:4, fontSize:10, color:C.dim}}>{minW} lb</div>
-        </div>
-        <div style={{display:"flex", gap:16, marginTop:10, fontSize:11, color:C.dim}}>
-          <span><span style={{color:C.amber}}>●</span> your weigh-ins</span>
-          <span><span style={{color:C.dim}}>┄</span> projected</span>
-        </div>
-        <div style={{display:"flex", justifyContent:"space-between", fontSize:10, color:C.dim, marginTop:4}}>
-          <span>{fmtDate(PLAN.dexa.start.date)}</span><span>{fmtDate(PLAN.dexa.next.date)} (DEXA)</span>
-        </div>
-      </div>
+      <WeightChart weighIns={weighIns} />
 
       <div style={{display:"flex", gap:12, marginTop:14}}>
         <div style={{...card, flex:1, textAlign:"center"}}>
@@ -675,10 +931,14 @@ function ProgressView({ days, completed, setCompleted, workouts, savedMeals, set
         <div style={{marginTop:10, fontSize:13, lineHeight:1.9}}>
           <Row k="Start (DEXA #2, Jun 13)" v="180.9 lb · 22.3% BF" />
           <Row k="Next scan (DEXA #4)" v="Jan 15, 2027" />
-          <Row k="Projected end weight" v="~185-187 lb" />
-          <Row k="Projected end BF%" v="~21-22%" />
-          <Row k="Muscle gain goal" v="~4.5-5 lb" />
+          <Row k="Projected end weight" v="~191 lb (Jan 15)" />
+          <Row k="Projected end BF%" v="~21.9%" />
+          <Row k="Glycogen refill (wks 1-3)" v="~+3.5 lb (water, not muscle)" />
+          <Row k="Real muscle goal" v="~5 lb vs restored base" />
         </div>
+        <p style={{fontSize:11, color:C.dim, margin:"10px 0 0"}}>
+          The ~10 lb total gain = ~3.5 lb glycogen/water refill + ~5 lb real muscle + ~1.5 lb fat. Judge muscle against the restored ~144 lb lean baseline, not the depleted 140.5.
+        </p>
       </div>
 
       {noted.length>0 && (
@@ -696,21 +956,154 @@ function ProgressView({ days, completed, setCompleted, workouts, savedMeals, set
         </div>
       )}
 
+      <ExerciseProgress workouts={workouts} />
+
       <BackupPanel days={days} workouts={workouts} completed={completed} savedMeals={savedMeals}
         setDays={setDays} setWorkouts={setWorkouts} setCompleted={setCompleted} setSavedMeals={setSavedMeals} />
     </React.Fragment>
   );
 }
 
+// ── Exercise progress: compounds in time-series, secondaries in list ──
+function ExerciseProgress({ workouts }) {
+  // Build per-exercise session history: avg weight & avg reps across sets each day
+  const history = useMemo(() => {
+    const byEx = {}; // name -> [{date, avgW, avgR, cat}]
+    Object.keys(workouts).sort().forEach((d) => {
+      const day = workouts[d];
+      if (!day || day.run || !Array.isArray(day)) return;
+      day.forEach((ex) => {
+        const ws = ex.sets.map((s)=>parseFloat(s.w)).filter((n)=>!isNaN(n));
+        const rs = ex.sets.map((s)=>parseFloat(s.r)).filter((n)=>!isNaN(n));
+        if (!ws.length && !rs.length) return;
+        const avgW = ws.length ? ws.reduce((a,b)=>a+b,0)/ws.length : 0;
+        const avgR = rs.length ? rs.reduce((a,b)=>a+b,0)/rs.length : 0;
+        if (!byEx[ex.exercise]) byEx[ex.exercise] = [];
+        byEx[ex.exercise].push({ date: d, avgW: +avgW.toFixed(1), avgR: +avgR.toFixed(1), cat: ex.cat });
+      });
+    });
+    return byEx;
+  }, [workouts]);
+
+  // categorize using the SPLIT definitions (so it works even before much data)
+  const catOf = useMemo(() => {
+    const m = {};
+    Object.values(SPLIT).forEach((arr)=>arr.forEach((ex)=>{ m[ex.name]=ex.cat; }));
+    return m;
+  }, []);
+
+  const compounds = Object.keys(history).filter((n)=>catOf[n]==="primary");
+  const secondaries = Object.keys(history).filter((n)=>catOf[n]==="secondary");
+
+  const [picked, setPicked] = useState(null);
+  const compoundList = compounds.length ? compounds : Object.keys(SPLIT).flatMap((s)=>SPLIT[s]).filter((e)=>e.cat==="primary").map((e)=>e.name).filter((v,i,a)=>a.indexOf(v)===i);
+  const sel = picked || compoundList[0];
+  const series = history[sel] || [];
+
+  return (
+    <div style={{...card, marginTop:14}}>
+      <span style={fieldLabel}>Exercise progress</span>
+
+      {/* Compound selector */}
+      <div style={{display:"flex", gap:6, flexWrap:"wrap", marginTop:10}}>
+        {compoundList.map((n)=>(
+          <button key={n} onClick={()=>setPicked(n)} style={{
+            ...chipBtn,
+            background: sel===n ? C.amber : C.panel2,
+            color: sel===n ? "#1a1206" : C.dim,
+            borderColor: sel===n ? C.amber : C.line,
+          }}>{n}</button>
+        ))}
+      </div>
+
+      {/* Time-series chart for selected compound: avg weight over time */}
+      <CompoundChart series={series} name={sel} />
+
+      {/* Secondary lifts in list form */}
+      {secondaries.length > 0 && (
+        <div style={{marginTop:18}}>
+          <div style={{fontSize:12, color:C.dim, textTransform:"uppercase", letterSpacing:1, marginBottom:8}}>Secondary lifts — latest</div>
+          {secondaries.map((n)=>{
+            const s = history[n];
+            const latest = s[s.length-1];
+            const first = s[0];
+            const delta = s.length>1 ? (latest.avgW - first.avgW) : 0;
+            return (
+              <div key={n} style={{display:"flex", alignItems:"center", gap:8, padding:"7px 0", borderBottom:`1px solid ${C.line}`, fontSize:13}}>
+                <span style={{flex:1}}>{n}</span>
+                <span style={{color:C.dim}}>{latest.avgW}×{latest.avgR}</span>
+                {s.length>1 && <span style={{color: delta>0?C.green:delta<0?C.red:C.dim, width:54, textAlign:"right"}}>{delta>0?"+":""}{delta.toFixed(1)}</span>}
+              </div>
+            );
+          })}
+          <p style={{fontSize:11, color:C.dim, margin:"8px 0 0"}}>Showing avg weight × avg reps across sets, most recent session. Change is vs first logged session.</p>
+        </div>
+      )}
+
+      {compoundList.length>0 && series.length===0 && (
+        <p style={{fontSize:13, color:C.dim, marginTop:12}}>Log a few {sel} sessions and your avg-weight trend will plot here.</p>
+      )}
+    </div>
+  );
+}
+
+function CompoundChart({ series, name }) {
+  if (!series || series.length === 0) return null;
+  if (series.length === 1) {
+    const p = series[0];
+    return <div style={{marginTop:12, fontSize:13, color:C.dim}}>{name}: {p.avgW} lb × {p.avgR} reps avg on {fmtDate(p.date)}. One more session unlocks the trend chart.</div>;
+  }
+  const ws = series.map((p)=>p.avgW);
+  const minW = Math.floor(Math.min(...ws) - 5);
+  const maxW = Math.ceil(Math.max(...ws) + 5);
+  const t0 = new Date(series[0].date).getTime();
+  const t1 = new Date(series[series.length-1].date).getTime();
+  const span = (t1 - t0) || 1;
+  const xy = (p) => {
+    const x = ((new Date(p.date).getTime() - t0) / span) * 100;
+    const y = 100 - ((p.avgW - minW) / (maxW - minW || 1)) * 100;
+    return [x, y];
+  };
+  const pts = series.map(xy);
+  const path = pts.map((p,i)=>`${i?"L":"M"}${p[0]},${p[1]}`).join(" ");
+  const latest = series[series.length-1];
+  const change = (latest.avgW - series[0].avgW).toFixed(1);
+
+  return (
+    <div style={{marginTop:12}}>
+      <div style={{display:"flex", justifyContent:"space-between", alignItems:"baseline", marginBottom:6}}>
+        <span style={{fontSize:13, color:C.text, fontWeight:600}}>{latest.avgW} lb avg</span>
+        <span style={{fontSize:12, color: change>0?C.green:change<0?C.red:C.dim}}>{change>0?"+":""}{change} lb since start</span>
+      </div>
+      <div style={{position:"relative", height:150}}>
+        <svg viewBox="0 0 100 100" preserveAspectRatio="none" style={{width:"100%", height:"100%"}}>
+          {[0,50,100].map((g)=><line key={g} x1="0" y1={g} x2="100" y2={g} stroke={C.line} strokeWidth="0.3" />)}
+          <path d={path} fill="none" stroke={C.amber} strokeWidth="1.4" vectorEffect="non-scaling-stroke" />
+          {pts.map((p,i)=><circle key={i} cx={p[0]} cy={p[1]} r="1.3" fill={C.amber} vectorEffect="non-scaling-stroke" />)}
+        </svg>
+        <div style={{position:"absolute", top:0, left:2, fontSize:10, color:C.dim}}>{maxW}</div>
+        <div style={{position:"absolute", bottom:0, left:2, fontSize:10, color:C.dim}}>{minW} lb</div>
+      </div>
+      <div style={{display:"flex", justifyContent:"space-between", fontSize:10, color:C.dim, marginTop:4}}>
+        <span>{fmtDate(series[0].date)}</span><span>{fmtDate(latest.date)}</span>
+      </div>
+    </div>
+  );
+}
+
 function BackupPanel({ days, workouts, completed, savedMeals, setDays, setWorkouts, setCompleted, setSavedMeals }) {
   const [text, setText] = useState("");
   const [msg, setMsg] = useState("");
+  const [confirmArmed, setConfirmArmed] = useState(false);
+  const [ghToken, setGhToken] = useState(getGitHubToken() || "");
+  const [backingUp, setBackingUp] = useState(false);
+  const [tokenModal, setTokenModal] = useState(false);
+  const [tokenInput, setTokenInput] = useState("");
 
   const exportData = () => {
     const bundle = { v: 1, exportedAt: new Date().toISOString(), days, workouts, completed, savedMeals };
     const str = JSON.stringify(bundle);
     setText(str);
-    // try clipboard
     if (navigator.clipboard) {
       navigator.clipboard.writeText(str).then(
         () => setMsg("Copied to clipboard — paste somewhere safe."),
@@ -721,19 +1114,70 @@ function BackupPanel({ days, workouts, completed, savedMeals, setDays, setWorkou
     }
   };
 
+  const backupToGitHub = async () => {
+    if (!ghToken.trim()) {
+      setMsg("No GitHub token. Tap 'Set GitHub Token' first.");
+      return;
+    }
+    setBackingUp(true);
+    const bundle = { v: 1, exportedAt: new Date().toISOString(), days, workouts, completed, savedMeals };
+    const result = await createGitHubGist(ghToken, bundle);
+    setBackingUp(false);
+    if (result.success) {
+      setMsg(`✓ Backed up to GitHub Gist`);
+    } else {
+      setMsg(`GitHub backup failed: ${result.error}`);
+    }
+  };
+
+  const saveToken = () => {
+    if (!tokenInput.trim()) {
+      setMsg("Token cannot be empty.");
+      return;
+    }
+    setGitHubToken(tokenInput);
+    setGhToken(tokenInput);
+    setTokenInput("");
+    setTokenModal(false);
+    setMsg("✓ GitHub token saved locally (never leaves your device).");
+  };
+
+  const clearGhToken = () => {
+    clearGitHubToken();
+    setGhToken("");
+    setMsg("GitHub token cleared.");
+  };
+
   const importData = () => {
     if (!text.trim()) { setMsg("Paste your backup text into the box first."); return; }
+    let b;
     try {
-      const b = JSON.parse(text.trim());
-      if (!b || typeof b !== "object") throw new Error("bad");
-      if (!confirm("Importing will REPLACE all current data with the backup. Continue?")) return;
+      b = JSON.parse(text.trim());
+    } catch {
+      setMsg("That doesn't look like valid backup text. Check you pasted the whole thing.");
+      return;
+    }
+    if (!b || typeof b !== "object") {
+      setMsg("That doesn't look like a valid backup.");
+      return;
+    }
+    if (!confirmArmed) {
+      setConfirmArmed(true);
+      setMsg("This will REPLACE all current data. Tap Import again to confirm.");
+      return;
+    }
+    // second tap confirms
+    try {
       if (b.days) setDays(b.days);
       if (b.workouts) setWorkouts(b.workouts);
       if (b.completed) setCompleted(b.completed);
       if (b.savedMeals) setSavedMeals(b.savedMeals);
-      setMsg("Imported successfully ✓");
-    } catch {
-      setMsg("That doesn't look like a valid backup. Check you pasted the whole thing.");
+      const nDays = b.days ? Object.keys(b.days).length : 0;
+      const nWk = b.workouts ? Object.keys(b.workouts).length : 0;
+      setConfirmArmed(false);
+      setMsg(`Imported ✓ — ${nDays} day(s), ${nWk} workout(s) restored.`);
+    } catch (e) {
+      setMsg("Import failed while saving. Try again.");
     }
   };
 
@@ -741,19 +1185,70 @@ function BackupPanel({ days, workouts, completed, savedMeals, setDays, setWorkou
     <div style={{...card, marginTop:14}}>
       <span style={fieldLabel}>Backup &amp; restore</span>
       <p style={{fontSize:12, color:C.dim, margin:"8px 0 0"}}>
-        Export bundles all your data into text you can save (notes, email). Import restores it — useful for moving between devices or recovering after clearing browser data.
+        Export/Import bundles all data. GitHub Gist creates secure cloud backups with one tap.
       </p>
-      <div style={{display:"flex", gap:8, marginTop:10}}>
-        <button onClick={exportData} style={{...addBtn, flex:1, padding:"10px 0"}}>Export</button>
-        <button onClick={importData} style={{...addBtn, flex:1, padding:"10px 0", background:C.blue, color:"#06121f"}}>Import</button>
+
+      {/* GitHub Backup Section */}
+      <div style={{marginTop:12, padding:10, borderRadius:8, background:C.panel2, border:`1px solid ${C.line}`}}>
+        <div style={{fontSize:13, fontWeight:600, marginBottom:6}}>GitHub Gist Backup</div>
+        {ghToken ? (
+          <React.Fragment>
+            <div style={{fontSize:11, color:C.green, marginBottom:8}}>✓ Token set (secure, local only)</div>
+            <div style={{display:"flex", gap:6}}>
+              <button onClick={backupToGitHub} disabled={backingUp} style={{...addBtn, flex:1, padding:"8px 0", opacity: backingUp?0.6:1}}>
+                {backingUp ? "Backing up..." : "Backup Now"}
+              </button>
+              <button onClick={clearGhToken} style={{...ghostBtn, padding:"8px 0", minWidth:80}}>Clear</button>
+            </div>
+          </React.Fragment>
+        ) : (
+          <button onClick={() => setTokenModal(true)} style={{...addBtn, width:"100%", padding:"8px 0"}}>Set GitHub Token</button>
+        )}
+        <p style={{fontSize:10, color:C.dim, margin:"6px 0 0"}}>Creates private timestamped gists. Token never leaves your device.</p>
       </div>
-      <textarea
-        value={text}
-        onChange={(e)=>setText(e.target.value)}
-        placeholder="Your exported backup text appears here. To restore, paste a backup in and tap Import."
-        style={{...input, height:90, resize:"vertical", fontFamily:"monospace", fontSize:11}}
-      />
-      {msg && <p style={{fontSize:12, color: msg.includes("✓")||msg.includes("Copied")?C.green:C.amber, margin:"8px 0 0"}}>{msg}</p>}
+
+      {/* Token input modal */}
+      {tokenModal && (
+        <div style={{
+          position:"fixed", inset:0, background:"rgba(0,0,0,0.5)", display:"flex", alignItems:"center", justifyContent:"center", zIndex:100, padding:16
+        }}>
+          <div style={{...card, maxWidth:400, width:"100%", padding:16}}>
+            <div style={{fontSize:14, fontWeight:600, marginBottom:8}}>GitHub Personal Access Token</div>
+            <p style={{fontSize:12, color:C.dim, marginBottom:10}}>
+              Create a token at <span style={{fontFamily:"monospace", color:C.text}}>github.com/settings/tokens</span> with 'gist' scope.
+            </p>
+            <input
+              type="password"
+              placeholder="ghp_..."
+              value={tokenInput}
+              onChange={(e) => setTokenInput(e.target.value)}
+              style={{...input, marginBottom:10}}
+            />
+            <div style={{display:"flex", gap:8}}>
+              <button onClick={saveToken} style={{...addBtn, flex:1, padding:"10px 0"}}>Save</button>
+              <button onClick={() => { setTokenModal(false); setTokenInput(""); }} style={{...ghostBtn, flex:1, padding:"10px 0"}}>Cancel</button>
+            </div>
+          </div>
+        </div>
+      )}
+
+      {/* Standard Export/Import */}
+      <div style={{marginTop:12}}>
+        <div style={{display:"flex", gap:8}}>
+          <button onClick={exportData} style={{...addBtn, flex:1, padding:"10px 0"}}>Export</button>
+          <button onClick={importData} style={{...addBtn, flex:1, padding:"10px 0", background: confirmArmed?C.red:C.blue, color: confirmArmed?"#fff":"#06121f"}}>
+            {confirmArmed ? "Confirm import" : "Import"}
+          </button>
+        </div>
+        <textarea
+          value={text}
+          onChange={(e)=>{ setText(e.target.value); setConfirmArmed(false); }}
+          placeholder="Your exported backup text appears here. To restore, paste a backup in and tap Import."
+          style={{...input, height:90, resize:"vertical", fontFamily:"monospace", fontSize:11, marginTop:8}}
+        />
+      </div>
+
+      {msg && <p style={{fontSize:12, color: msg.includes("✓")?C.green:msg.includes("failed")?C.red:C.amber, margin:"8px 0 0"}}>{msg}</p>}
     </div>
   );
 }
@@ -767,6 +1262,11 @@ const page = { minHeight:"100vh", background:C.bg, color:C.text, fontFamily:"'In
 const header = { display:"flex", justifyContent:"space-between", alignItems:"center", padding:"calc(18px + env(safe-area-inset-top)) 16px 12px", maxWidth:720, margin:"0 auto" };
 const bottomNav = { position:"fixed", bottom:0, left:0, right:0, display:"flex", background:C.panel, borderTop:`1px solid ${C.line}`, paddingBottom:"env(safe-area-inset-bottom)", zIndex:50 };
 const navBtn = { flex:1, display:"flex", flexDirection:"column", alignItems:"center", justifyContent:"center", background:"none", border:"none", padding:"10px 0 8px", cursor:"pointer" };
+const dayStripWrap = { display:"flex", alignItems:"center", gap:4, padding:"0 12px", maxWidth:720, margin:"0 auto" };
+const arrowBtn = { background:C.panel2, border:`1px solid ${C.line}`, color:C.text, borderRadius:8, width:30, height:46, flexShrink:0, cursor:"pointer", fontSize:18 };
+const dayCell = { flex:1, display:"flex", flexDirection:"column", alignItems:"center", gap:2, padding:"5px 0", border:"none", borderRadius:8, cursor:"pointer", minWidth:0 };
+const chipBtn = { border:`1px solid ${C.line}`, borderRadius:16, padding:"5px 11px", fontSize:12, cursor:"pointer", fontWeight:500 };
+const miniToggle = { border:`1px solid ${C.line}`, borderRadius:7, padding:"4px 12px", fontSize:12, cursor:"pointer", fontWeight:600 };
 const card = { background:C.panel, border:`1px solid ${C.line}`, borderRadius:12, padding:16 };
 const fieldLabel = { fontSize:11, color:C.dim, textTransform:"uppercase", letterSpacing:1 };
 const input = { width:"100%", background:C.panel2, border:`1px solid ${C.line}`, borderRadius:8, color:C.text, padding:"10px 12px", marginTop:6, boxSizing:"border-box", outline:"none" };
